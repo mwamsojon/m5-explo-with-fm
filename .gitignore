@@ -1,0 +1,30 @@
+# Credentials
+kaggle.json
+*.env
+.env*
+
+# Data (large files)
+data/
+
+# Binaries
+bin/
+
+# Virtual envs (all locations)
+.venv/
+notebooks/.venv
+notebooks/tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
