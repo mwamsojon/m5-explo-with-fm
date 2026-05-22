@@ -228,11 +228,13 @@ class M5BenchmarkSuite:
         self,
         horizon: int = 28,
         model_path: str = "/mnt/lab/nmwamsojo/autogluon_models/",
+        base_dir: str = "/mnt/lab/nmwamsojo/prepared_data/",
         n_jobs: int = -1,
     ):
         self.horizon    = horizon
         self.model_path = model_path
         self.n_jobs     = n_jobs
+        self.base_dir   = base_dir
 
 
     def run(
@@ -271,7 +273,7 @@ class M5BenchmarkSuite:
         
 
         for method in ag_methods:
-            paths = self.get_forecast_paths(wrapper_dict["cutoff_day"],wrapper_dict["level"], model_tag=wrapper_dict["cutoff_day"], data_tag=wrapper_dict["data_tag"])
+            paths = self.get_forecast_paths(wrapper_dict["cutoff_day"], wrapper_dict["level"], model_tag=method.lower(), data_tag=wrapper_dict["data_tag"])
             
             use_cache = os.path.exists(paths["forecast"]) and not force_refit
 
@@ -289,6 +291,7 @@ class M5BenchmarkSuite:
         return results
 
     def _run_local(self, train_df: pd.DataFrame, methods: list[str]) -> dict[str, pd.DataFrame]:
+        import gc
         print(f"--- Running local benchmarks {methods} (joblib n_jobs={self.n_jobs}) ---")
 
         last_date    = train_df["date"].max()
@@ -305,13 +308,20 @@ class M5BenchmarkSuite:
         )
         series_ids    = wide.index.tolist()
         series_arrays = [wide.loc[sid].values for sid in series_ids]
+        del wide
+        gc.collect()
 
         dfs = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_forecast_one_series)(sid, arr, self.horizon, methods)
             for sid, arr in zip(series_ids, series_arrays)
         )
+        del series_ids, series_arrays
+        gc.collect()
 
         combined = pd.concat(dfs, axis=0, ignore_index=True)
+        del dfs
+        gc.collect()
+
         date_map = {i + 1: d for i, d in enumerate(future_dates)}
         combined["date"] = combined["horizon"].map(date_map)
         combined.drop(columns="horizon", inplace=True)
@@ -321,6 +331,9 @@ class M5BenchmarkSuite:
             m_df = combined[["id", "date", method]].rename(columns={method: "sales_quantity"})
             m_df["id"] = m_df["id"].astype(str)
             out[method] = m_df.reset_index(drop=True)
+        del combined
+        gc.collect()
+
         return out
 
 
@@ -352,6 +365,7 @@ class M5BenchmarkSuite:
         model_dict: dict | None = None,
         wrapper_dict: dict | None = None,
     ) -> pd.DataFrame:
+        import gc
         from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
 
         print(f"--- Running {method} via AutoGluon (statsforecast backend) ---")
@@ -365,17 +379,24 @@ class M5BenchmarkSuite:
                 grp.sort_values("date").iloc[nz[0]:] if len(nz) else grp
             )
         trimmed_df = pd.concat(trimmed_parts, ignore_index=True)
+        del trimmed_parts
+        gc.collect()
 
         ag_df = TimeSeriesDataFrame.from_data_frame(
             trimmed_df, id_column="id", timestamp_column="date",
         )
+        del trimmed_df
+        gc.collect()
 
         if static_df is not None:
             temp_static = static_df.set_index("id").copy()
             temp_static = temp_static.loc[:, ~temp_static.columns.duplicated()]
             temp_static.index = temp_static.index.astype(str)
             temp_static.index.name = "item_id"
+            if "item_id" in temp_static.columns:
+                temp_static = temp_static.drop(columns=["item_id"])
             ag_df.static_features = temp_static.reindex(ag_df.item_ids)
+            del temp_static
 
         hp_map = {
             # R line 302: es(ts(input, frequency=7), h=28) from smooth package
@@ -394,15 +415,15 @@ class M5BenchmarkSuite:
 
         predictor = TimeSeriesPredictor(
             prediction_length = self.horizon,
-            target            = wrapper_dict["target"] if wrapper_dict and "target" in wrapper_dict else "sales_quantity",
-            eval_metric       = wrapper_dict["eval_metric"] if wrapper_dict and "eval_metric" in wrapper_dict else "RMSSE",
+            target            = (wrapper_dict or {}).get("target", "sales_quantity"),
+            eval_metric       = (wrapper_dict or {}).get("eval_metric", "RMSSE"),
             path              = specific_path,
         ).fit(
             ag_df,
             hyperparameters      = hp_map[method],
-            enable_ensemble      = wrapper_dict["enable_ensemble"], # False,
-            skip_model_selection = wrapper_dict["skip_model_selection"], #True,
-            verbosity            = wrapper_dict["verbosity"], #0,
+            enable_ensemble      = (wrapper_dict or {}).get("enable_ensemble", False),
+            skip_model_selection = (wrapper_dict or {}).get("skip_model_selection", True),
+            verbosity            = (wrapper_dict or {}).get("verbosity", 0),
         )
 
         # [BUG3-FIX] Pass the FULL ag_df to predict — do NOT truncate context.
@@ -410,8 +431,18 @@ class M5BenchmarkSuite:
         # past observations. Truncating to 28 rows gives a completely wrong
         # smoothed state. R's es() fits on the full trimmed series.
         predictions = predictor.predict(ag_df)
+        del ag_df
 
         f_df = predictions["mean"].reset_index()
+        del predictions, predictor
+        shutil.rmtree(specific_path, ignore_errors=True)
+        gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
         f_df.columns = ["id", "date", "sales_quantity"]
         f_df["sales_quantity"] = f_df["sales_quantity"].clip(lower=0)
         f_df["id"] = f_df["id"].astype(str)

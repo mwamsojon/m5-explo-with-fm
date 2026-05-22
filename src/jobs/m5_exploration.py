@@ -45,6 +45,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
 import warnings
 from typing import Any
 
@@ -304,6 +305,7 @@ class M5ExplorationSuite:
         os.makedirs(paths["folder"], exist_ok=True)
         f_df.to_parquet(paths["forecast"], index=False)
         print(f"[{exp_tag}] Forecast saved → {paths['forecast']}")
+        shutil.rmtree(paths["ag_model"], ignore_errors=True)
 
         return f_df
     
@@ -462,10 +464,13 @@ class M5ExplorationSuite:
         future_cols = tuple(sorted(["id", "date"] + known_cov_cols)) if known_cov_cols else None
         future_key = future_cols
 
-        # ---- TRAIN CACHE ----
+        # ---- TRAIN CACHE (max 1 entry — evict stale key before caching new one) ----
         if train_key in self._cached_tsdf:
             ag_train = self._cached_tsdf[train_key]
         else:
+            if self._cached_tsdf:
+                self._cached_tsdf.clear()
+                gc.collect()
             ag_train = TimeSeriesDataFrame.from_data_frame(
                 hist_df[list(train_cols)],
                 id_column="id",
@@ -485,11 +490,13 @@ class M5ExplorationSuite:
 
             self._cached_tsdf[train_key] = ag_train
 
-        # ---- FUTURE CACHE ----
+        # ---- FUTURE CACHE (max 1 entry — evict stale key before caching new one) ----
         if known_cov_cols:
             if future_key in self._cached_future:
                 ag_future = self._cached_future[future_key]
             else:
+                if self._cached_future:
+                    self._cached_future.clear()
                 fut_cols = [c for c in ["id", "date"] + known_cov_cols if c in future_df.columns]
 
                 ag_future = TimeSeriesDataFrame.from_data_frame(
@@ -646,6 +653,10 @@ class M5ExplorationSuite:
         if ag_future is not None and known_cov_cols:
             predict_kwargs["known_covariates"] = ag_future
 
+        print(f"[DBG] ag_train items={len(ag_train.item_ids)}  shape={ag_train.shape}")
+        if predict_kwargs.get("known_covariates") is not None:
+            kc = predict_kwargs["known_covariates"]
+            print(f"[DBG] ag_future items={len(kc.item_ids)}  shape={kc.shape}")
         predictions = predictor.predict(ag_train, **predict_kwargs)
 
         # DELETE 
@@ -658,6 +669,8 @@ class M5ExplorationSuite:
 
         del predictions, predictor
         gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         f_df.columns = ["id", "date", "sales_quantity"]
         f_df["sales_quantity"] = f_df["sales_quantity"].clip(lower=0)

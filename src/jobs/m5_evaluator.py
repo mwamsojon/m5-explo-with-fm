@@ -247,6 +247,7 @@ class M5Evaluator:
         raw_train_df: pd.DataFrame,
         trimmed_train_df: pd.DataFrame,
         static_df: pd.DataFrame,
+        weights_df: pd.DataFrame=None,
         target_col: str = "sales_quantity",
         price_col: str = "sell_price",
         use_gpu: bool = True,
@@ -268,11 +269,60 @@ class M5Evaluator:
         self._static_cols  = list(self._static.columns)
 
         print("  Building hierarchy scales and weights …", flush=True)
-        self.level_info = self._build_hierarchy(raw_train_df, trimmed_train_df)
 
-    # ----------------------------------------------------------------------- #
-    #  Hierarchy construction                                                  #
-    # ----------------------------------------------------------------------- #
+        if weights_df is not None:
+            self.level_info = self.build_hierarchy_from_df(weights_df)
+        else:
+            self.level_info = self._build_hierarchy(raw_train_df, trimmed_train_df)
+
+    def build_hierarchy_from_df(self, weights_df: pd.DataFrame) -> dict:
+        """
+        Reconstruct the level_info dict from the flat weights DataFrame.
+        Also sets self.ids, self._raw_date_cols, self._trimmed_date_cols
+        so that evaluate_all() works without _build_hierarchy().
+
+        Parameters
+        ----------
+        weights_df : pd.DataFrame
+            Columns: level, id, scale, weight
+        """
+        level_info = {}
+
+        for lvl, group in weights_df.groupby("level"):
+            lvl  = int(lvl)
+            cols = self.LEVELS[lvl]
+            ids  = group["id"].values
+
+            # L1: single aggregate row → plain RangeIndex (matches _build_hierarchy)
+            if lvl == 1:
+                index = pd.RangeIndex(start=0, stop=1, step=1)
+            elif lvl == 12:
+                # Bottom level: plain object Index named 'id' (not Categorical)
+                index = pd.Index(ids, dtype="object", name="id")
+                # Capture the 30,490 bottom-level series ids for evaluate_all()
+                self.ids = pd.Index(ids, dtype="object", name="id")
+            else:
+                # L2-L11: CategoricalIndex named after the last groupby col
+                index = pd.CategoricalIndex(
+                    ids, categories=ids, ordered=False, name=cols[-1]
+                )
+
+            level_info[lvl] = {
+                "scales":        group["scale"].values.astype(np.float64),
+                "weights":       group["weight"].values.astype(np.float32),
+                "cols":          cols,
+                "index":         index,
+                "use_raw_dates": (lvl != 12),
+            }
+
+        # These are not recoverable from weights_df alone; set to None so that
+        # any accidental access fails loudly rather than silently using stale data.
+        # evaluate_all() only uses self.ids and self._static — these are not needed.
+        self.date_cols          = None
+        self._raw_date_cols     = None
+        self._trimmed_date_cols = None
+
+        return level_info
 
     def _build_hierarchy(
         self,
@@ -486,16 +536,19 @@ class M5Evaluator:
             for lvl, score in pool.map(lambda l: _level_score(l), range(1, 13)):
                 level_scores[lvl] = score
 
-        f12_vals = f12[date_cols].values
-        a12_vals = a12[date_cols].values
-        a_sum    = np.sum(a12_vals)
+        # .copy() severs any numpy-view dependency on f12/a12 memory blocks.
+        # del _level_score first: the closure references f12/a12 via __closure__
+        # cells; deleting the name does not free them while the closure lives.
+        f12_vals = f12[date_cols].values.copy()
+        a12_vals = a12[date_cols].values.copy()
+        a_sum    = float(np.sum(a12_vals))
         if a_sum < 1e-6:
             warnings.warn(
                 "[M5Evaluator] Actual values sum near-zero — WAPE unreliable.",
                 stacklevel=2,
             )
-        
-        del f12, a12
+
+        del _level_score, f12, a12
         gc.collect()
 
         ordered = [level_scores[l] for l in range(1, 13)]

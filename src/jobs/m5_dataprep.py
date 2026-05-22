@@ -65,7 +65,8 @@ class M5DataPipeline:
         }
         self.covariates  = ["wm_yr_wk", "wday", "month", "year",
                             "event_name_1", "event_type_1",
-                            "snap_CA", "snap_TX", "snap_WI", "sell_price"]
+                            "snap_CA", "snap_TX", "snap_WI", 
+                            "sell_price", "is_friday", "is_saturday", "is_sunday"]
         self.static_cols = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
 
     # ── Path helpers ──────────────────────────────────────────────────────────
@@ -195,6 +196,13 @@ class M5DataPipeline:
         df_aggr["id"] = df_aggr["id"].astype(str)
         df_aggr = df_aggr.sort_values([self.id, self.date]).reset_index(drop=True)
 
+        day_names = df_aggr['date'].dt.day_name()
+
+        # Create the binary of day of the weekend
+        df_aggr['is_friday']   = (day_names == 'Friday').astype(int)
+        df_aggr['is_saturday'] = (day_names == 'Saturday').astype(int)
+        df_aggr['is_sunday']   = (day_names == 'Sunday').astype(int)
+
         cutoff    = pd.Timestamp(cutoff_day)
         mask      = df_aggr[self.date] <= cutoff
         hist_df   = df_aggr[mask].copy()
@@ -206,12 +214,58 @@ class M5DataPipeline:
         static_df = (df_aggr[[self.id] + static_present]
                        .drop_duplicates().reset_index(drop=True))
 
+
         print(f"Done. {df_aggr[self.id].nunique():,} series | "
               f"Hist: {len(hist_df):,} rows | Future: {len(future_df):,} rows")
         del df_aggr
         gc.collect()
 
         return hist_df, future_df, static_df
+
+    def compute_smoothness_segments(self, hist_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Classify each series into one of four demand patterns using data-adaptive
+        ADI / CV² thresholds (60th-percentile of the observed distributions).
+
+        Called on hist_df_trimmed so leading pre-launch zeros don't inflate ADI.
+        All-zero and single-sale series land in "Undefined" (NaN ADI or CV²).
+        """
+        nz_df = hist_df[hist_df[self.target] > 0]
+
+        g   = hist_df.groupby("id")[self.target]
+        gnz = nz_df.groupby("id")[self.target]
+
+        total_periods  = g.size()
+        non_zero_count = gnz.size().reindex(total_periods.index)  # NaN for all-zero series
+        adi = total_periods / non_zero_count
+
+        # std(ddof=1) → NaN for series with exactly one non-zero sale
+        nz_mean = gnz.mean().reindex(total_periods.index)
+        nz_std  = gnz.std().reindex(total_periods.index)
+        cv2 = (nz_std / nz_mean) ** 2
+
+        adi_arr = adi.values
+        cv2_arr = cv2.values
+
+        # nanquantile ignores NaN from all-zero / single-sale series
+        adi_thresh = np.nanquantile(adi_arr, 0.6)
+        cv2_thresh = np.nanquantile(cv2_arr, 0.6)
+
+        conditions = [
+            (adi_arr < adi_thresh) & (cv2_arr < cv2_thresh),
+            (adi_arr < adi_thresh) & (cv2_arr >= cv2_thresh),
+            (adi_arr >= adi_thresh) & (cv2_arr < cv2_thresh),
+            (adi_arr >= adi_thresh) & (cv2_arr >= cv2_thresh),
+        ]
+        choices = ["Smooth", "Erratic", "Intermittent", "Lumpy"]
+        segment = np.select(conditions, choices, default="Undefined")
+
+        return pd.DataFrame({
+            "id":               adi.index,
+            "ADI":              adi_arr,
+            "CV2":              cv2_arr,
+            "smoothness_segs":  segment,
+        }).reset_index(drop=True)
 
     def trim_series_to_active(self, df, id_col="id", target_col="sales_quantity"):
         """
@@ -433,6 +487,13 @@ class M5DataPipeline:
             # Parquet round-trips can promote float32 → float64; downcast back
             for df in (hist_df, hist_df_trimmed, future_df):
                 self.optimize_dtypes(df)
+            # Backfill smoothness column if cache predates this feature
+            if "smoothness_segs" not in weights_scales.columns:
+                segs = self.compute_smoothness_segments(hist_df_trimmed)
+                weights_scales = weights_scales.merge(
+                    segs[["id", "ADI", "CV2", "smoothness_segs"]], on="id", how="left"
+                )
+                weights_scales.to_parquet(weights_scales_path, index=False)
             return hist_df, hist_df_trimmed, future_df, static_df, weights_scales
 
         reason = "Force Reprepare" if force_reprepare else "Cache Miss"
@@ -443,6 +504,12 @@ class M5DataPipeline:
 
         print("  Building weights & scales …", flush=True)
         weights_scales = self._build_weights_scales(hist_df, hist_df_trimmed, static_df)
+
+        print("  Computing smoothness segments …", flush=True)
+        segs = self.compute_smoothness_segments(hist_df_trimmed)
+        weights_scales = weights_scales.merge(
+            segs[["id", "ADI", "CV2", "smoothness_segs"]], on="id", how="left"
+        )
 
         os.makedirs(paths["folder"], exist_ok=True)
         hist_df.to_parquet(paths["hist"],              index=False)
