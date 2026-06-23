@@ -1,15 +1,53 @@
 [project]
-name = "tsfm-explo"
+name = "tsfm-m5"
 version = "0.1.0"
-description = "M5 Forecasting Project"
+description = "Cold-start demand forecasting with Chronos-2 on M5 — code for the article"
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
 dependencies = [
-    "autogluon-timeseries>=1.5.0",
-    "ipykernel>=7.2.0",
+    # Foundation model inference
+    "chronos-forecasting>=1.4.0",
+    # Gradient boosting baseline
+    "lightgbm>=4.0",
+    # Fast feature engineering
+    "polars>=0.20",
+    # HPO
+    "optuna>=3.0",
+    # Core data stack
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "pyarrow>=12.0",
+    "scipy>=1.10",
+    # LoRA / PEFT demo
+    "peft>=0.10",
+    "torch>=2.0",
+    # Parallel scale computation
+    "joblib>=1.3",
+    # M5 official WRMSSE helper (optional cross-check)
     "m5-wrmsse>=1.0.0",
+    # Notebooks
+    "ipykernel>=7.2.0",
     "seaborn>=0.13.2",
+    "matplotlib>=3.7",
 ]
 
 [dependency-groups]
-dev = []
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tsfm_m5"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

@@ -1,30 +1,55 @@
-# Credentials
+# ── Credentials ──────────────────────────────────────────────────────────────
 kaggle.json
 *.env
 .env*
+secrets/
 
-# Data (large files)
+# ── Data (large — configure via M5_DATA_PATH / M5_LAB_DIR env vars) ──────────
 data/
+raw/
 
-# Binaries
+# ── Binaries ──────────────────────────────────────────────────────────────────
 bin/
 
-# Virtual envs (all locations)
+# ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
-notebooks/.venv
-notebooks/tmp
+notebooks/.venv/
+venv/
+env/
 
-# Python
+# ── Python artifacts ──────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
-venv/
+*.egg
 dist/
 build/
+*.so
+.eggs/
 
-# Jupyter checkpoints
+# ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+notebooks/tmp/
 
-# OS
+# ── Lab run outputs (live on /mnt/lab, not committed) ────────────────────────
+output/
+*.db           # Optuna SQLite study databases
+*.log          # Run logs
+*.out          # nohup output files
+
+# ── Archive (exploratory scripts that served their purpose) ───────────────────
+archive/
+
+# ── Reports: binary exports and superseded drafts (keep .md, ignore .docx/v1) ─
+reports/*.docx
+reports/article_chronos2_retail_guide_v1.md
+reports/findings_zs_global_survey.md
+
+# ── IDE / tool state ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.claude/
+notebooks/.claude/
+*.local.json
 .DS_Store
+Thumbs.db
