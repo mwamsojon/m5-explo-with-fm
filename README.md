@@ -37,6 +37,87 @@ This is a mechanistically justified cold-start advantage, not just an empirical 
 
 ---
 
+## How we got here (experimental journey)
+
+The numbered `experiments/` pipeline above is the clean, reproducible distillation.
+The real path was ~25+ named Optuna studies (`v2`, `v5`–`v27`, `store_ensemble_v1`,
+`category_weight_v1/v2`, `state_weight_v1`, …) and a lot of dead ends. Recording
+the order and the negative results here, because the negative results are exactly
+the part that's easy to forget and expensive to re-discover:
+
+1. **Statistical baselines first.** Full reproduction of the M5 competition's own
+   R benchmark script (Naive/SES/MA/ETS/ARIMA/Croston/TSB/ADIDA/…, 12 methods) as
+   floors — `M5Evaluator` intentionally preserves 4 known bugs in the original R
+   script so results stay comparable to the official benchmark.
+2. **Chronos-2 zero-shot, manual context-length (CL) grid search.** Short context
+   (CL 1–16) dominates — M5 series are highly intermittent, long context mostly
+   adds noise.
+3. **Segmentation/grouping sensitivity.** Tested grouping series by weight-quartile,
+   store, state×weight, category×weight, and department for Chronos-2's
+   cross-learning batching. **Department won** — cross-learning benefits more from
+   product-category peers than geographic (store) peers. Store-grouped ZS (v14)
+   was measurably worse than dept-grouped.
+4. **`cross_learning=True` turned out to be the single biggest lever in the whole
+   study** — enabling Chronos-2's group attention (same CL, same grouping, just
+   flipping the flag) was worth ~0.025 geo-mean WRMSSE on its own, bigger than most
+   of the HPO effort combined. This isn't obvious from the API — it's a group
+   attention mechanism described in the Chronos-2 technical report, not something
+   you'd find by tuning hyperparameters.
+5. **A real bug found and fixed:** `PeftModel.forward()` (the LoRA fine-tuning path)
+   was numerically incompatible with Chronos-2's quantile inference — fixed via
+   `merge_and_unload()` (reproduced in `experiments/demo_peft_bug.py`). This voided
+   every LoRA fine-tuning result from before the fix (roughly v15–v22).
+6. **Fine-tuning abandoned as a lever.** A steps-curve experiment (FT steps ∈
+   {0, 5, 10, 25, 50, 100, 500}) showed only a marginal gain at 5 steps
+   (spring EW 0.8623 → 0.8581) followed by monotonic degradation —
+   catastrophic forgetting. In hindsight this experiment should have been run
+   *before* the many rounds of FT-hyperparameter HPO that preceded it, not after.
+7. **A zero-leakage ensemble blend design catastrophically failed.** Calibrating
+   OLS blend weights on 2014–2015 windows and applying them to the 2015–2016 test
+   period gave geo 1.386 — far worse than the leaky, LOO-on-test approach used
+   everywhere else. Chronos-2 zero-shot performance is **non-stationary across
+   years** on this dataset, so the leaky approach, while methodologically
+   imperfect, was judged the only workable way to learn ensemble weights here.
+   This is a known, documented limitation, not an oversight.
+8. **The tier ensemble turned out to be load-bearing.** Removing it (dept-ZS-only
+   + OLS) degrades geo-mean from 0.7969 to 0.9829. The tier ensemble mixes
+   zero-shot and minimal-fine-tune forecasts by sales-volume quartile — a
+   different, complementary grouping axis from department.
+9. **A systematic FOODS under-forecast bias emerged** in the OLS scale weights
+   (FOODS_1=1.59, FOODS_2=1.18, FOODS_3=1.16) — the working hypothesis is that
+   dept-grouped cross-learning reinforces the bias, since FOODS peers all
+   under-forecast together and have nothing to correct against within the group.
+10. **LightGBM (global + per-department, 37 lag/rolling/price/calendar features,
+    tweedie objective, Optuna-tuned) became the final best result** — geo-mean
+    0.6198, beating the best Chronos-2 ensemble (0.7969) by 22%. This is what
+    forced the article's reframe (see below).
+11. **LightGBM × Chronos-2 OLS blend was a negative result** — 0.6254, worse than
+    LightGBM alone. The two models don't have enough diversity for blending to help
+    once LightGBM has full-history lag features available.
+12. **Cold-start natural-segmentation analysis became the headline finding** —
+    bucketing series by *active history length* (not calendar time) revealed the
+    28-day crossover described at the top of this README. A controlled-truncation
+    version of this experiment was tried and dropped as methodologically unsound
+    (the LightGBM checkpoint was trained on full history; NaN-masking short
+    history at inference time is not the same as training on short history).
+13. **An earlier AutoGluon-wrapped Chronos + fine-tuning approach was abandoned
+    outright** once the project moved to calling the Chronos-2 API directly with
+    explicit segmentation/OLS (roughly the v9 cutover point above). Its HPO
+    artifacts (`category_weight_v1/v2`, `state_weight_v1`, `weight_v8`,
+    `v6_perfs_validation`, `v7_selective_ft`, and a large `explorations/` directory
+    — collectively ~890 GB) were deleted in August 2026 as pure regenerable dead
+    weight from a superseded approach; nothing in the current `experiments/`
+    pipeline depends on them.
+
+**Article reframe (2026-06-23):** the original framing — "Chronos-2 beats
+everything" — didn't survive finding #10 above (LightGBM wins on full history by
+22%). The article was reframed from general superiority to the cold-start claim,
+which is both true and more useful in practice: traditional ML needs months of
+history before `lag_28`-style features exist; Chronos-2 is competitive from day
+one with zero feature engineering and no retraining.
+
+---
+
 ## Repository layout
 
 ```
@@ -192,6 +273,39 @@ with zero training data.
 **Cross-learning:** enabled via `predict_quantiles(cross_learning=True)`,
 semantic batches (same department together). Random batching with covariates
 gives worse results than univariate — coherent grouping is required.
+
+---
+
+## Lessons learned / pitfalls to avoid re-hitting
+
+- **PeftModel + Chronos-2 LoRA bug** — `PeftModel.forward()` is numerically
+  incompatible with Chronos-2's quantile inference unless you call
+  `merge_and_unload()` first. See `experiments/demo_peft_bug.py`. Any LoRA
+  result you find without this fix applied is invalid.
+- **Fine-tuning past ~5-10 steps causes catastrophic forgetting** on this
+  dataset/model pair. Run the steps-curve check *first*, before any
+  FT-hyperparameter search — we did it in the wrong order and paid for it in
+  wasted HPO trials.
+- **M5 `id` suffix bug:** forgetting to strip `_evaluation`/`_validation` from
+  `id` before reindexing against the submission format silently produces an
+  all-zero comparison and a WRMSSE of 5.17 — that number alone is now a red flag
+  meaning "check the id join," not a real result.
+- **Ensemble blend weights learned on one period don't transfer across years**
+  on this dataset — Chronos-2 zero-shot performance is non-stationary
+  year-to-year. A "zero-leakage" calibrate-then-apply design will look
+  catastrophically worse than a leaky LOO design; that's a property of the
+  data, not a bug in the zero-leakage code.
+- **Cross-learning grouping axis matters more than most HPO knobs** — semantic
+  (department/product-category) grouping beats geographic (store) grouping by a
+  wide margin. If extending this work to a new grouping axis, department-style
+  (semantic) groupings are the prior to start from.
+- **OOM guardrail for parallel jobs:** always launch `experiments/lgbm_watchdog.sh`
+  alongside any heavy parallel/multi-worker job — 3 parallel `M5DataPipeline`
+  workers is enough to OOM the machine.
+- **`notebooks/tmp/`, `bin/micromamba`, stray AutoGluon test-run logs, and a
+  broken `notebooks/.venv` symlink were cleaned up (Aug 2026)** as pure cache —
+  regenerate with `uv sync` / a fresh `bin/micromamba` download if ever needed,
+  nothing there was unique.
 
 ---
 
